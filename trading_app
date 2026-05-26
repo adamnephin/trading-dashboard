@@ -1,0 +1,242 @@
+import streamlit as st
+import requests
+import pandas as pd
+import datetime
+import os
+
+# ===== CONFIG =====
+API_KEY = "YOUR_POLYGON_KEY"
+RISK_PER_TRADE = 0.01
+JOURNAL_FILE = "trade_journal.csv"
+
+st.set_page_config(layout="wide")
+st.title("📊 Pro Trading Dashboard")
+
+# ===== SIDEBAR =====
+st.sidebar.header("⚙️ Settings")
+
+capital = st.sidebar.number_input("Starting Capital ($)", value=10000)
+
+tickers_input = st.sidebar.text_input(
+    "Watchlist",
+    value="NVDA,TSLA,AMD,AAPL"
+)
+
+min_score = st.sidebar.slider("Minimum Trade Score", 1, 6, 3)
+
+tickers = [t.strip().upper() for t in tickers_input.split(",")]
+
+# ===== DATA =====
+def get_price(ticker):
+    try:
+        url = f"https://api.polygon.io/v2/last/trade/{ticker}?apiKey={API_KEY}"
+        data = requests.get(url).json()
+        return data["results"]["p"]
+    except:
+        return None
+
+# ===== STRATEGIES =====
+def breakout(price):
+    return {
+        "name": "Breakout",
+        "bias": "bullish",
+        "entry": price,
+        "stop": price * 0.99,
+        "target": price * 1.03,
+        "confidence": "high"
+    }
+
+def pullback(price):
+    return {
+        "name": "Pullback",
+        "bias": "bullish",
+        "entry": price,
+        "stop": price * 0.995,
+        "target": price * 1.02,
+        "confidence": "medium"
+    }
+
+def reversal(price):
+    return {
+        "name": "Reversal",
+        "bias": "bearish",
+        "entry": price,
+        "stop": price * 1.01,
+        "target": price * 0.97,
+        "confidence": "low"
+    }
+
+# ===== SCORING =====
+def score_trade(t):
+    score = 0
+    if t["confidence"] == "high":
+        score += 3
+    elif t["confidence"] == "medium":
+        score += 2
+    else:
+        score += 1
+
+    rr = abs(t["target"] - t["entry"]) / abs(t["entry"] - t["stop"])
+    if rr >= 2:
+        score += 2
+    elif rr >= 1.5:
+        score += 1
+
+    return score
+
+# ===== POSITION SIZE =====
+def position_size(capital, trade):
+    risk_amount = capital * RISK_PER_TRADE
+    risk_per_share = abs(trade["entry"] - trade["stop"])
+    return max(int(risk_amount / risk_per_share), 0)
+
+# ===== AI REASONING (RULE-BASED) =====
+def generate_reasoning(trade):
+    reasons = []
+
+    if trade["name"] == "Breakout":
+        reasons.append("Price is pushing into new highs → breakout potential")
+        reasons.append("Momentum traders likely to enter")
+
+    if trade["name"] == "Pullback":
+        reasons.append("Price pulled back to a potential support zone")
+        reasons.append("Trend continuation setup")
+
+    if trade["name"] == "Reversal":
+        reasons.append("Price may be overextended")
+        reasons.append("Potential for mean reversion")
+
+    # Risk/reward
+    rr = abs(trade["target"] - trade["entry"]) / abs(trade["entry"] - trade["stop"])
+    reasons.append(f"Risk/Reward ≈ {rr:.2f}")
+
+    return reasons
+
+# ===== JOURNAL =====
+def log_trade(trade, exit_price):
+    pnl = (exit_price - trade["entry"]) * trade["qty"]
+    if trade["bias"] == "bearish":
+        pnl = -pnl
+
+    row = {
+        "time": datetime.datetime.now(),
+        "ticker": trade["ticker"],
+        "strategy": trade["name"],
+        "entry": trade["entry"],
+        "exit": exit_price,
+        "qty": trade["qty"],
+        "pnl": pnl
+    }
+
+    df = pd.DataFrame([row])
+
+    if not os.path.exists(JOURNAL_FILE):
+        df.to_csv(JOURNAL_FILE, index=False)
+    else:
+        df.to_csv(JOURNAL_FILE, mode="a", header=False, index=False)
+
+# ===== MAIN =====
+if st.button("🚀 Analyze Market"):
+
+    results = []
+    used_risk = 0
+    max_risk = capital * 0.05
+
+    for ticker in tickers:
+        price = get_price(ticker)
+        if not price:
+            continue
+
+        strategies = [
+            breakout(price),
+            pullback(price),
+            reversal(price)
+        ]
+
+        for s in strategies:
+            s["ticker"] = ticker
+            s["price"] = price
+            s["score"] = score_trade(s)
+            s["qty"] = position_size(capital, s)
+            s["risk"] = abs(s["entry"] - s["stop"]) * s["qty"]
+            results.append(s)
+
+    results = sorted(results, key=lambda x: x["score"], reverse=True)
+
+    selected = []
+
+    for trade in results:
+        if trade["score"] < min_score:
+            continue
+        if used_risk + trade["risk"] > max_risk:
+            continue
+
+        selected.append(trade)
+        used_risk += trade["risk"]
+
+        if len(selected) >= 3:
+            break
+
+    # ===== LAYOUT =====
+    col1, col2 = st.columns([3, 1])
+
+    with col1:
+        st.subheader("📊 Charts + Trades")
+
+        for t in selected:
+
+            st.markdown(f"### {t['ticker']} — {t['name']}")
+
+            # ✅ TradingView Chart Embed
+            st.components.v1.html(f"""
+                https://s.tradingview.com/widgetembed/?symbol={t['ticker']}&interval=5&theme=dark
+                </iframe>
+            """, height=320)
+
+            # ✅ Trade Info
+            st.markdown(f"""
+            **Entry:** {t['entry']:.2f} | **Stop:** {t['stop']:.2f} | **Target:** {t['target']:.2f}  
+            **Shares:** {t['qty']} | **Risk:** ${t['risk']:.2f} | **Score:** {t['score']}
+            """)
+
+            # ✅ AI REASONING
+            st.markdown("**🧠 AI Reasoning:**")
+            for r in generate_reasoning(t):
+                st.write(f"- {r}")
+
+            # ✅ JOURNAL INPUT
+            exit_price = st.number_input(f"Exit Price ({t['ticker']})", key=t["ticker"])
+
+            if st.button(f"Log Trade {t['ticker']}", key=t["ticker"] + "_log"):
+                log_trade(t, exit_price)
+                st.success("Trade logged ✅")
+
+            st.divider()
+
+    with col2:
+        st.subheader("📦 Portfolio")
+
+        st.metric("Capital", f"${capital}")
+        st.metric("Used Risk", f"${used_risk:.2f}")
+        st.metric("Max Risk", f"${max_risk:.2f}")
+
+        st.progress(min(used_risk / max_risk, 1.0))
+
+# ===== JOURNAL VIEW =====
+st.subheader("📒 Trade Journal")
+
+if os.path.exists(JOURNAL_FILE):
+    df = pd.read_csv(JOURNAL_FILE)
+
+    total_pnl = df["pnl"].sum()
+
+    st.metric("Total P&L", f"${total_pnl:.2f}")
+
+    st.dataframe(df)
+
+    # Win rate
+    wins = len(df[df["pnl"] > 0])
+    total = len(df)
+    win_rate = (wins / total * 100) if total > 0 else 0
+
+    st.metric("Win Rate", f"{win_rate:.1f}%")
